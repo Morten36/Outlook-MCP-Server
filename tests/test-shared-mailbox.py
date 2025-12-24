@@ -11,7 +11,7 @@ def access_shared_mailbox():
         namespace = outlook.GetNamespace("MAPI")
         
         # Method 1: Access shared mailbox by email address
-        shared_email = "accessfx.ad.prod.escalation@jpmorgan.com"  # Your actual shared mailbox
+        shared_email = "someone@example.com"  # Your actual shared mailbox
         
         try:
             # Get the shared mailbox folder

@@ -11,11 +11,16 @@ import threading
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
+import uuid
 
 from ..config.config_reader import config
 
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    force=True  # <- overrides any prior basicConfig
+)
 logger = logging.getLogger(__name__)
-
 
 class OutlookClient:
     """High-performance client for accessing Outlook mailboxes with optimized search."""
@@ -235,116 +240,129 @@ class OutlookClient:
                                 include_shared: bool = True) -> List[Dict[str, Any]]:
         """Legacy method - redirects to search_emails for backward compatibility."""
         return self.search_emails(subject, include_personal, include_shared)
-    
+
     def _search_mailbox_wrapper(self, mailbox_type: str, search_text: str, 
-                               max_results: int) -> List[Dict[str, Any]]:
-        """Wrapper for parallel mailbox search with proper COM initialization."""
-        # Initialize COM for this thread
-        pythoncom.CoInitialize()
-        
+                                max_results: int) -> List[Dict[str, Any]]:
+        """Wrapper for parallel mailbox search with proper per-thread COM usage."""
+        # Explicit STA init for this thread
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
         try:
+            # Create Outlook COM objects *in this thread*
+            outlook = win32com.client.gencache.EnsureDispatch("Outlook.Application")
+            session = outlook.Session  # same as outlook.GetNamespace("MAPI")
+
             if mailbox_type == 'personal':
-                inbox = self.namespace.GetDefaultFolder(6)
+                inbox = session.GetDefaultFolder(6)  # olFolderInbox
                 return self._search_mailbox_comprehensive(
                     inbox, search_text, 'personal', max_results
                 )
+
             elif mailbox_type == 'shared':
-                # Use cached recipient if available
-                if not self._shared_recipient_cache:
-                    shared_email = config.get('shared_mailbox_email')
-                    self._shared_recipient_cache = self.namespace.CreateRecipient(shared_email)
-                    self._shared_recipient_cache.Resolve()
-                
-                if self._shared_recipient_cache.Resolved:
-                    shared_inbox = self.namespace.GetSharedDefaultFolder(self._shared_recipient_cache, 6)
+                # Don't reuse a cached Recipient across threads.
+                shared_email = config.get('shared_mailbox_email')
+                recip = session.CreateRecipient(shared_email)
+                recip.Resolve()
+                if recip.Resolved:
+                    shared_inbox = session.GetSharedDefaultFolder(recip, 6)  # olFolderInbox
                     return self._search_mailbox_comprehensive(
                         shared_inbox, search_text, 'shared', max_results
                     )
+                else:
+                    logger.error(f"Could not resolve shared recipient: {shared_email}")
+                    return []
+
             return []
+
         except Exception as e:
             logger.error(f"Error in mailbox wrapper for {mailbox_type}: {e}")
             return []
         finally:
-            # Uninitialize COM for this thread
             pythoncom.CoUninitialize()
-    
+
     def _search_mailbox_comprehensive(self, inbox_folder, search_text: str,
-                                      mailbox_type: str, max_results: int) -> List[Dict[str, Any]]:
-        """Optimized search using AdvancedSearch for near-instant body/content matching."""
+                                      mailbox_type: str, max_results: int):
         emails = []
-        found_ids = set()  # Track found emails to avoid duplicates
-        
+        found_ids = set()
+
+        app = inbox_folder.Application  # keep COM objects on this thread
+
+        # ---- Build Scope safely (single-quoted, apostrophes doubled) ----
+        folder_path = inbox_folder.FolderPath or ""
+        scope = self._get_english_folder_path(inbox_folder)
+
+        # ---- Build Filter safely (DASL with @SQL=) ----
+        esc = (search_text or "").replace("'", "''")  # single quotes doubled for literals
+        query = (
+            "@SQL="
+            "\"urn:schemas:httpmail:subject\" ci_phrasematch '{t}' "
+            "OR "
+            "\"urn:schemas:httpmail:textdescription\" ci_phrasematch '{t}'"
+        ).format(t=esc)
+
+        # (Optional) keep tags reasonably short; some environments are picky
+        tag = "EmailBodySearch-" + str(uuid.uuid4())[:8]
+
+        logger.info("AdvancedSearch Scope=%s Filter=%s", scope, query)
+
         try:
-            # Get folder path for scope
-            scope = f"'{inbox_folder.FolderPath}'"
-            
-            # Escape special characters for DASL query (double quotes need escaping)
-            search_text_escaped = search_text.replace('"', '""')
-            
-            # Build DASL query for subject OR body (textdescription includes body content)
-            # Using ci_phrasematch for case-insensitive exact phrase matching
-            query = (
-                f'urn:schemas:httpmail:subject ci_phrasematch "{search_text_escaped}" OR '
-                f'urn:schemas:httpmail:textdescription ci_phrasematch "{search_text_escaped}"'
-            )
-            
-            logger.info(f"Performing AdvancedSearch in {scope} for '{search_text}'")
-            
-            # Perform advanced search (asynchronous, but we poll for completion)
-            search = self.outlook.AdvancedSearch(
-                Scope=scope,
-                Filter=query,
-                SearchSubFolders=False,  # Don't search subfolders for inbox
-                Tag="EmailBodySearch"  # Unique tag for this search
-            )
-            
-            # Poll for completion with timeout
-            start_time = time.time()
-            while not search.SearchComplete:
-                time.sleep(0.1)
-                if time.time() - start_time > 30:  # Timeout after 30 seconds
-                    logger.warning("AdvancedSearch timed out after 30 seconds")
+            # ---- Call positionally to avoid named-arg binding issues ----
+            # Signature: AdvancedSearch(Scope, Filter, SearchSubFolders, Tag)
+            search = app.AdvancedSearch(scope, query, False, tag)
+
+            # Poll until results stabilize or timeout
+            start = time.time()
+            last = -1
+            stable = 0.0
+            while True:
+                results = search.Results  # same-thread COM access
+                count = results.Count
+                if count == last:
+                    stable += 0.1
+                else:
+                    stable = 0.0
+                    last = count
+                if stable >= 0.5 or (time.time() - start) > 30:
                     break
-            
-            if search.SearchComplete:
-                results = search.Results
-                result_count = min(results.Count, max_results)  # Limit early
-                logger.info(f"AdvancedSearch completed: found {results.Count} matches (taking {result_count})")
-                
-                for i in range(1, result_count + 1):
-                    try:
-                        item = results.Item(i)
-                        entry_id = getattr(item, 'EntryID', '')
-                        if entry_id and entry_id not in found_ids:
-                            email_data = self._extract_email_data(item, inbox_folder.Name, mailbox_type)
-                            if email_data:
-                                emails.append(email_data)
-                                found_ids.add(entry_id)
-                    except Exception as e:
-                        logger.debug(f"Error processing result {i}: {e}")
-                        continue
-            else:
-                logger.warning("AdvancedSearch did not complete successfully")
-        
-        except Exception as e:
-            logger.error(f"AdvancedSearch failed: {e}")
-            logger.info("Falling back to traditional search methods")
-            
-            # Fallback to original Restrict filters if AdvancedSearch fails
-            # This ensures robustness if indexing is disabled or incomplete
-            search_text_escaped = search_text.replace("'", "''").replace('"', '""')
-            items = inbox_folder.Items
-            items.Sort("[ReceivedTime]", True)
-            
-            # Try subject search first (always fast)
+                time.sleep(0.1)
+
+            take = min(results.Count, max_results)
+            logger.info("AdvancedSearch returned %d (taking %d)", results.Count, take)
+
+            for i in range(1, take + 1):
+                try:
+                    item = results.Item(i)
+                    entry_id = getattr(item, 'EntryID', '')
+                    if entry_id and entry_id not in found_ids:
+                        email_data = self._extract_email_data(item, inbox_folder.Name, mailbox_type)
+                        if email_data:
+                            emails.append(email_data)
+                            found_ids.add(entry_id)
+                except Exception as e:
+                    logger.debug("Error processing result %d: %s", i, e)
+                    continue
+
+            # Clean up the running search (optional but tidy)
             try:
-                subject_filter = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{search_text_escaped}%'"
-                filtered_items = items.Restrict(subject_filter)
-                
-                for item in filtered_items:
+                app.AdvancedSearchStop(search.SearchID)
+            except Exception:
+                pass
+
+        except Exception as e:
+
+            logger.info("AdvancedSearch failed: %s", e)
+            logger.info("Falling back to Restrict() search")
+
+            # -- Fallback: subject LIKE (fast) --
+            try:
+                items = inbox_folder.Items
+                items.Sort("[ReceivedTime]", True)
+                esc_like = (search_text or "").replace("'", "''")
+                subject_filter = (
+                    "@SQL=\"urn:schemas:httpmail:subject\" LIKE '%" + esc_like + "%'"
+                )
+                for item in items.Restrict(subject_filter):
                     if len(emails) >= max_results:
                         break
-                    
                     entry_id = getattr(item, 'EntryID', '')
                     if entry_id and entry_id not in found_ids:
                         email_data = self._extract_email_data(item, inbox_folder.Name, mailbox_type)
@@ -352,24 +370,20 @@ class OutlookClient:
                             emails.append(email_data)
                             found_ids.add(entry_id)
             except Exception as fallback_error:
-                logger.debug(f"Fallback subject filter failed: {fallback_error}")
-        
-        # Search other folders if enabled and we need more results
+                logger.error("Fallback subject filter failed: %s", fallback_error)
+
+        # Optional: search sibling folders
         if len(emails) < max_results and config.get_bool('search_all_folders', True):
             try:
-                additional_emails = self._search_other_folders(
-                    inbox_folder.Parent,
-                    search_text,
-                    mailbox_type,
-                    max_results - len(emails),
-                    found_ids
+                more = self._search_other_folders(
+                    inbox_folder.Parent, search_text, mailbox_type,
+                    max_results - len(emails), found_ids
                 )
-                emails.extend(additional_emails)
+                emails.extend(more)
             except Exception as e:
-                logger.error(f"Error searching other folders: {e}")
-        
+                logger.error("Error searching other folders: %s", e)
+
         return emails
-    
     
     def _search_other_folders(self, store, search_text: str, mailbox_type: str, 
                              max_results: int, found_ids: set) -> List[Dict[str, Any]]:
@@ -534,6 +548,22 @@ class OutlookClient:
         
         return text
 
+    def _get_english_folder_path(self, folder):
+        # Convert localized names (like "Posteingang") to internal English names
+        # Works because MAPIFolder.FolderPath always uses localized names
+        path = folder.FolderPath
+        # Normalize localized root paths for common locales
+        replacements = {
+            "\\Posteingang": "\\Inbox",
+            "\\Gesendete Elemente": "\\Sent Items",
+            "\\Entwürfe": "\\Drafts",
+            "\\Gelöschte Elemente": "\\Deleted Items",
+            "\\Junk-E-Mail": "\\Junk Email",
+        }
+        for de, en in replacements.items():
+            if path.endswith(de):
+                path = path.replace(de, en)
+        return f"'{path.replace("'", "''")}'"
 
 # Global client instance
 outlook_client = OutlookClient()
